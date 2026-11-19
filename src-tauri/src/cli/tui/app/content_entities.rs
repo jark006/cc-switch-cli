@@ -362,6 +362,20 @@ impl App {
                 };
                 Action::None
             }
+            Intent::Reorder => {
+                let Some(row) = visible.get(self.provider_idx) else {
+                    return Action::None;
+                };
+                let direction = match key.code {
+                    KeyCode::Char('+') => MoveDirection::Up,
+                    KeyCode::Char('-') => MoveDirection::Down,
+                    _ => return Action::None,
+                };
+                Action::ProviderReorder {
+                    id: row.id.clone(),
+                    direction,
+                }
+            }
             Intent::RefreshQuota => {
                 let Some(row) = visible.get(self.provider_idx) else {
                     return Action::None;
@@ -1432,6 +1446,36 @@ mod tests {
 
         let action = app.on_key(key(KeyCode::Char('o')), &data);
         assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn provider_plus_minus_keys_request_reorder() {
+        let mut app = App::new(Some(AppType::Codex));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+
+        let mut data = UiData::default();
+        data.providers.rows.push(provider_row("p1"));
+        data.providers.rows.push(provider_row("p2"));
+        app.provider_idx = 1;
+
+        let up = app.on_key(key(KeyCode::Char('+')), &data);
+        assert!(matches!(
+            up,
+            Action::ProviderReorder {
+                ref id,
+                direction: MoveDirection::Up
+            } if id == "p2"
+        ));
+
+        let down = app.on_key(key(KeyCode::Char('-')), &data);
+        assert!(matches!(
+            down,
+            Action::ProviderReorder {
+                ref id,
+                direction: MoveDirection::Down
+            } if id == "p2"
+        ));
     }
 
     #[test]

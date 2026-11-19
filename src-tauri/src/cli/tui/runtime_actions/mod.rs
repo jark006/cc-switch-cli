@@ -927,6 +927,7 @@ pub(crate) fn handle_action(
         Action::ProviderMoveFailoverQueue { id, direction } => {
             providers::move_failover_queue(&mut ctx, id, direction)
         }
+        Action::ProviderReorder { id, direction } => providers::reorder(&mut ctx, id, direction),
         Action::ProviderQuotaRefresh { .. } => Ok(()),
         Action::ProviderModelFetch {
             base_url,

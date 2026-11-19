@@ -113,6 +113,7 @@ pub(crate) mod providers {
         LaunchTemp,
         Failover,
         SetDefault,
+        Reorder,
     }
 
     pub(crate) const BINDINGS: &[Binding<Intent>] = &[
@@ -193,6 +194,13 @@ pub(crate) mod providers {
             label: set_default_label,
             shown: set_default_shown,
         },
+        Binding {
+            display: "+/-",
+            keys: &[KeyCode::Char('+'), KeyCode::Char('-')],
+            intent: Intent::Reorder,
+            label: |_, _| texts::tui_key_reorder(),
+            shown: reorder_shown,
+        },
     ];
 
     pub(crate) fn intent_for(key: KeyCode) -> Option<Intent> {
@@ -220,6 +228,25 @@ pub(crate) mod providers {
 
     fn selected_editable(app: &App, data: &UiData) -> bool {
         selected_row(app, data).is_some_and(|row| !data::provider_is_read_only(&app.app_type, row))
+    }
+
+    fn reorder_shown(app: &App, data: &UiData) -> bool {
+        if matches!(app.app_type, AppType::Pi)
+            || (supports_failover_controls(&app.app_type) && data.proxy.auto_failover_enabled)
+        {
+            return false;
+        }
+        let Some(selected) = selected_row(app, data) else {
+            return false;
+        };
+        if data::provider_is_pinned_official(&app.app_type, selected) || !selected.is_saved {
+            return false;
+        }
+        visible_providers(&app.app_type, &app.filter, data)
+            .iter()
+            .filter(|row| row.is_saved && !data::provider_is_pinned_official(&app.app_type, row))
+            .count()
+            > 1
     }
 
     fn import_shown(_app: &App, data: &UiData) -> bool {
@@ -804,6 +831,14 @@ mod tests {
             providers::intent_for(KeyCode::Char('x')),
             Some(Intent::SetDefault)
         );
+        assert_eq!(
+            providers::intent_for(KeyCode::Char('+')),
+            Some(Intent::Reorder)
+        );
+        assert_eq!(
+            providers::intent_for(KeyCode::Char('-')),
+            Some(Intent::Reorder)
+        );
         assert_eq!(providers::intent_for(KeyCode::Char('z')), None);
     }
 
@@ -818,6 +853,61 @@ mod tests {
             );
             seen.push(binding.intent);
         }
+    }
+
+    fn provider_row(id: &str, category: Option<&str>) -> crate::cli::tui::data::ProviderRow {
+        let mut provider = crate::provider::Provider::with_id(
+            id.to_string(),
+            id.to_string(),
+            serde_json::json!({"env": {}}),
+            None,
+        );
+        provider.category = category.map(str::to_string);
+        crate::cli::tui::data::ProviderRow {
+            id: id.to_string(),
+            provider,
+            api_url: None,
+            is_current: false,
+            is_in_config: true,
+            is_saved: true,
+            is_default_model: false,
+            primary_model_id: None,
+            default_model_id: None,
+        }
+    }
+
+    fn has_reorder_hint(
+        app: &crate::cli::tui::app::App,
+        data: &crate::cli::tui::data::UiData,
+    ) -> bool {
+        providers::key_bar_items(app, data)
+            .iter()
+            .any(|(display, _)| *display == "+/-")
+    }
+
+    #[test]
+    fn providers_reorder_hint_requires_two_visible_reorderable_rows() {
+        let mut app = crate::cli::tui::app::App::new(Some(crate::app_config::AppType::Claude));
+        let mut data = crate::cli::tui::data::UiData::default();
+        data.providers
+            .rows
+            .push(provider_row("official", Some("official")));
+        data.providers.rows.push(provider_row("first", None));
+        app.provider_idx = 1;
+        assert!(!has_reorder_hint(&app, &data));
+
+        data.providers.rows.push(provider_row("second", None));
+        assert!(has_reorder_hint(&app, &data));
+
+        let mut unsaved = provider_row("live-only", None);
+        unsaved.is_saved = false;
+        data.providers.rows.push(unsaved);
+        app.provider_idx = 3;
+        assert!(!has_reorder_hint(&app, &data));
+
+        app.filter.input.set("second");
+        app.provider_idx = 0;
+        assert!(!has_reorder_hint(&app, &data));
     }
 
     #[test]

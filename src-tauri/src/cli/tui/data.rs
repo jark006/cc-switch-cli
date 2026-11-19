@@ -1456,6 +1456,25 @@ pub(crate) fn provider_is_read_only(app_type: &AppType, row: &ProviderRow) -> bo
             == Some(crate::hermes_config::PROVIDER_SOURCE_DICT)
 }
 
+/// The app's official subscription provider stays at the top of the list:
+/// reorder keys never move it, and persisted order always starts with it.
+pub(crate) fn provider_is_pinned_official(app_type: &AppType, row: &ProviderRow) -> bool {
+    provider_is_pinned_official_provider(app_type, &row.provider)
+}
+
+pub(crate) fn provider_is_pinned_official_provider(
+    app_type: &AppType,
+    provider: &Provider,
+) -> bool {
+    if matches!(app_type, AppType::Codex) && provider.is_codex_official() {
+        return true;
+    }
+    provider
+        .category
+        .as_deref()
+        .is_some_and(|category| category.eq_ignore_ascii_case("official"))
+}
+
 pub(crate) fn quota_target_for_current_provider(
     app_type: &AppType,
     data: &UiData,
@@ -1490,7 +1509,7 @@ fn load_providers_with_mode(
 
     let providers = ProviderService::list(state, app_type.clone())?;
     let current_id = current_provider_for_mode(state, app_type, mode, &providers)?;
-    let sorted = sort_providers(&providers);
+    let sorted = sort_providers(app_type, &providers);
 
     let openclaw_live_providers = if matches!(app_type, AppType::OpenClaw) {
         crate::openclaw_config::get_providers()?
@@ -1688,17 +1707,24 @@ fn current_provider_for_mode(
         .map(|opt| opt.unwrap_or_default())
 }
 
-fn sort_providers(providers: &IndexMap<String, Provider>) -> Vec<(String, Provider)> {
+fn sort_providers(
+    app_type: &AppType,
+    providers: &IndexMap<String, Provider>,
+) -> Vec<(String, Provider)> {
     let mut items = providers
         .iter()
         .map(|(id, p)| (id.clone(), p.clone()))
         .collect::<Vec<_>>();
 
-    items.sort_by(|(_, a), (_, b)| match (a.sort_index, b.sort_index) {
-        (Some(idx_a), Some(idx_b)) => idx_a.cmp(&idx_b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.created_at.cmp(&b.created_at),
+    items.sort_by(|(_, a), (_, b)| {
+        provider_is_pinned_official_provider(app_type, b)
+            .cmp(&provider_is_pinned_official_provider(app_type, a))
+            .then_with(|| match (a.sort_index, b.sort_index) {
+                (Some(idx_a), Some(idx_b)) => idx_a.cmp(&idx_b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.created_at.cmp(&b.created_at),
+            })
     });
 
     items
@@ -3822,6 +3848,22 @@ mod tests {
             primary_model_id: None,
             default_model_id: None,
         }
+    }
+
+    #[test]
+    fn provider_sort_pins_official_ahead_of_a_lower_custom_index() {
+        let mut providers = IndexMap::new();
+        let mut official = test_provider_row("official", "Claude Official", json!({"env": {}}));
+        official.provider.category = Some("official".to_string());
+        official.provider.sort_index = Some(5);
+        let mut custom = test_provider_row("custom", "Custom", json!({"env": {}}));
+        custom.provider.sort_index = Some(0);
+        providers.insert("custom".to_string(), custom.provider);
+        providers.insert("official".to_string(), official.provider);
+
+        let sorted = sort_providers(&AppType::Claude, &providers);
+        assert_eq!(sorted[0].0, "official");
+        assert_eq!(sorted[1].0, "custom");
     }
 
     fn prompt_row(id: &str, created_at: Option<i64>, updated_at: Option<i64>) -> PromptRow {

@@ -398,6 +398,206 @@ pub(super) fn move_failover_queue(
     Ok(())
 }
 
+/// Move a provider up or down in the TUI list and persist the new order.
+///
+/// A move swaps the selected provider with its nearest visible neighbour that
+/// can be reordered. The app's official provider is pinned: it cannot be moved
+/// and always persists at the top (`sort_index = 0`). Moves operate on visible
+/// rows while a filter is active, and every persisted provider receives a fresh
+/// index so hidden rows cannot keep a stale or colliding position.
+pub(super) fn reorder(
+    ctx: &mut RuntimeActionContext<'_>,
+    id: String,
+    direction: crate::cli::tui::app::MoveDirection,
+) -> Result<(), AppError> {
+    use crate::app_config::AppType;
+    use crate::cli::tui::app::{supports_failover_controls, visible_providers, MoveDirection};
+
+    let app_type = ctx.app.app_type.clone();
+    if matches!(app_type, AppType::Pi) {
+        ctx.app.push_toast(
+            crate::t!(
+                "Pi provider order follows models.json and cannot be changed here.",
+                "Pi 的供应商顺序跟随 models.json，不能在这里调整。"
+            ),
+            ToastKind::Info,
+        );
+        return Ok(());
+    }
+
+    let state = load_state()?;
+
+    // `sort_index` doubles as the proxy failover priority. While automatic
+    // failover routes by that queue, reordering the list would silently move
+    // live traffic, so defer to the dedicated queue manager instead. Read the
+    // flag from the database: the UI snapshot can lag behind another process
+    // enabling failover.
+    if supports_failover_controls(&app_type) && state.db.get_proxy_flags_sync(app_type.as_str()).1 {
+        ctx.app.push_toast(
+            crate::t!(
+                "Automatic failover is on. Routing follows queue priority; press f to manage it.",
+                "自动故障转移已开启，路由由队列优先级决定；按 f 管理队列。"
+            ),
+            ToastKind::Info,
+        );
+        return Ok(());
+    }
+    let (managed_ids, official_ids) = {
+        let config = state.config.read().map_err(AppError::from)?;
+        let Some(manager) = config.get_manager(&app_type) else {
+            return Ok(());
+        };
+        let managed_ids = manager.providers.keys().cloned().collect::<Vec<_>>();
+        let official_ids = manager
+            .providers
+            .values()
+            .filter(|provider| {
+                crate::cli::tui::data::provider_is_pinned_official_provider(&app_type, provider)
+            })
+            .map(|provider| provider.id.clone())
+            .collect::<Vec<_>>();
+        (managed_ids, official_ids)
+    };
+
+    let (row_ids, visible_ids) = {
+        let data = &*ctx.data;
+        let row_ids = data
+            .providers
+            .rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let visible_ids = visible_providers(&app_type, &ctx.app.filter, data)
+            .into_iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        (row_ids, visible_ids)
+    };
+
+    let Some(display_position) = row_ids.iter().position(|row_id| row_id == &id) else {
+        return Ok(());
+    };
+
+    if !managed_ids.iter().any(|managed| managed == &id) {
+        ctx.app.push_toast(
+            crate::t!(
+                "This provider is not saved locally and cannot be reordered.",
+                "该供应商尚未保存到本地，无法调整顺序。"
+            ),
+            ToastKind::Info,
+        );
+        return Ok(());
+    }
+
+    // Start from the displayed order, then append persisted rows the current
+    // view filters out so every provider gets a fresh index below.
+    let mut order = row_ids
+        .iter()
+        .filter(|row_id| managed_ids.contains(*row_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for managed in &managed_ids {
+        if !order.contains(managed) {
+            order.push(managed.clone());
+        }
+    }
+
+    if official_ids.contains(&id) {
+        ctx.app.push_toast(
+            crate::t!(
+                "The official provider is pinned at the top and cannot be moved.",
+                "官方供应商固定在顶部，不能调整顺序。"
+            ),
+            ToastKind::Info,
+        );
+        return Ok(());
+    }
+
+    let neighbour = match direction {
+        MoveDirection::Up => row_ids[..display_position].iter().rposition(|row_id| {
+            managed_ids.contains(row_id)
+                && visible_ids.contains(row_id)
+                && !official_ids.contains(row_id)
+        }),
+        MoveDirection::Down => row_ids[display_position + 1..]
+            .iter()
+            .position(|row_id| {
+                managed_ids.contains(row_id)
+                    && visible_ids.contains(row_id)
+                    && !official_ids.contains(row_id)
+            })
+            .map(|offset| display_position + 1 + offset),
+    }
+    .map(|position| row_ids[position].clone());
+
+    let Some(neighbour) = neighbour else {
+        let message = match direction {
+            MoveDirection::Up => {
+                crate::t!("Already at the top of the list.", "已经在列表顶部。")
+            }
+            MoveDirection::Down => {
+                crate::t!("Already at the bottom of the list.", "已经在列表底部。")
+            }
+        };
+        ctx.app.push_toast(message, ToastKind::Info);
+        return Ok(());
+    };
+
+    let selected_position = order
+        .iter()
+        .position(|row_id| row_id == &id)
+        .expect("selected provider is persisted");
+    let neighbour_position = order
+        .iter()
+        .position(|row_id| row_id == &neighbour)
+        .expect("reorder neighbour is persisted");
+    order.swap(selected_position, neighbour_position);
+
+    // Official rows stay ahead of everything else, in their existing order.
+    let mut pinned = order
+        .iter()
+        .filter(|row_id| official_ids.contains(*row_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    pinned.extend(
+        order
+            .iter()
+            .filter(|row_id| !official_ids.contains(*row_id))
+            .cloned(),
+    );
+
+    let changed = {
+        let config = state.config.read().map_err(AppError::from)?;
+        let manager = config.get_manager(&app_type);
+        pinned.iter().enumerate().any(|(index, row_id)| {
+            manager
+                .and_then(|manager| manager.providers.get(row_id))
+                .is_some_and(|provider| provider.sort_index != Some(index))
+        })
+    };
+
+    if changed {
+        let updates = pinned
+            .iter()
+            .enumerate()
+            .map(|(sort_index, id)| ProviderSortUpdate {
+                id: id.clone(),
+                sort_index,
+            })
+            .collect::<Vec<_>>();
+        ProviderService::update_sort_order(&state, app_type.clone(), updates)?;
+    }
+    refresh_provider_data_after_write(ctx, &state)?;
+
+    let new_index = visible_providers(&app_type, &ctx.app.filter, ctx.data)
+        .iter()
+        .position(|row| row.id == id);
+    if let Some(index) = new_index {
+        ctx.app.provider_idx = index;
+    }
+    Ok(())
+}
+
 pub(super) fn delete(ctx: &mut RuntimeActionContext<'_>, id: String) -> Result<(), AppError> {
     if guard_last_active_failover_queue_entry(ctx, &id)? {
         return Ok(());
@@ -1385,6 +1585,441 @@ mod tests {
         let queue = state.db.get_failover_queue("claude").expect("read queue");
         assert_eq!(queue[0].provider_id, "second");
         assert_eq!(queue[1].provider_id, "first");
+    }
+
+    fn seed_reorder_providers(state: &AppState, entries: &[(&str, &str, &str)]) {
+        for (id, name, url) in entries {
+            seed_claude_live_settings(json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": *url,
+                    "LOCAL_ONLY": "preserve-me"
+                }
+            }))
+            .expect("seed live settings");
+            ProviderService::add(
+                state,
+                AppType::Claude,
+                Provider::with_id(
+                    (*id).to_string(),
+                    (*name).to_string(),
+                    json!({"env":{"ANTHROPIC_BASE_URL": *url}}),
+                    None,
+                ),
+            )
+            .expect("add provider");
+        }
+    }
+
+    fn load_state_with_official() -> AppState {
+        crate::store::AppState::try_new_with_startup_recovery()
+            .expect("load state with seeded official provider")
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_pins_official_first_and_keeps_selection() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(
+            &state,
+            &[
+                ("first", "First", "https://first.example.com"),
+                ("second", "Second", "https://second.example.com"),
+            ],
+        );
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+        let order = fixture
+            .data
+            .providers
+            .rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec!["claude-official", "first", "second"]);
+
+        reorder(
+            &mut fixture.ctx(),
+            "second".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("move second provider up");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(0));
+        assert_eq!(providers["second"].sort_index, Some(1));
+        assert_eq!(providers["first"].sort_index, Some(2));
+        assert_eq!(fixture.app.provider_idx, 1);
+
+        reorder(
+            &mut fixture.ctx(),
+            "claude-official".to_string(),
+            crate::cli::tui::app::MoveDirection::Down,
+        )
+        .expect("attempt to move official provider");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(0));
+        assert_eq!(providers["second"].sort_index, Some(1));
+        assert_eq!(providers["first"].sort_index, Some(2));
+        assert!(matches!(
+            fixture.app.toast,
+            Some(toast) if toast.kind == ToastKind::Info
+        ));
+
+        // The new order survives a fresh state load (restart).
+        let reloaded = AppState::try_new().expect("reload state");
+        let reloaded_order = {
+            let config = reloaded.config.read().expect("read config");
+            config
+                .get_manager(&AppType::Claude)
+                .expect("claude manager")
+                .providers
+                .values()
+                .map(|provider| provider.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reloaded_order, vec!["claude-official", "second", "first"]);
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_moves_down_and_stops_at_bottom() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(
+            &state,
+            &[
+                ("first", "First", "https://first.example.com"),
+                ("second", "Second", "https://second.example.com"),
+            ],
+        );
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+        fixture.app.provider_idx = 1;
+
+        reorder(
+            &mut fixture.ctx(),
+            "first".to_string(),
+            crate::cli::tui::app::MoveDirection::Down,
+        )
+        .expect("move first provider down");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(0));
+        assert_eq!(providers["second"].sort_index, Some(1));
+        assert_eq!(providers["first"].sort_index, Some(2));
+        assert_eq!(fixture.app.provider_idx, 2);
+
+        reorder(
+            &mut fixture.ctx(),
+            "first".to_string(),
+            crate::cli::tui::app::MoveDirection::Down,
+        )
+        .expect("attempt to move past the bottom");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["second"].sort_index, Some(1));
+        assert_eq!(providers["first"].sort_index, Some(2));
+        assert_eq!(fixture.app.provider_idx, 2);
+        assert!(matches!(
+            fixture.app.toast,
+            Some(toast) if toast.kind == ToastKind::Info
+        ));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_normalizes_official_index_when_a_move_succeeds() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(
+            &state,
+            &[
+                ("first", "First", "https://first.example.com"),
+                ("second", "Second", "https://second.example.com"),
+            ],
+        );
+        let mut official = state
+            .db
+            .get_provider_by_id("claude-official", "claude")
+            .expect("read official provider")
+            .expect("official provider exists");
+        official.sort_index = Some(3);
+        state
+            .db
+            .save_provider("claude", &official)
+            .expect("store nonzero official index");
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+
+        reorder(
+            &mut fixture.ctx(),
+            "second".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("move second provider up");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(0));
+        assert_eq!(providers["second"].sort_index, Some(1));
+        assert_eq!(providers["first"].sort_index, Some(2));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_does_not_write_on_refused_or_boundary_press() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(
+            &state,
+            &[
+                ("first", "First", "https://first.example.com"),
+                ("second", "Second", "https://second.example.com"),
+            ],
+        );
+        let mut official = state
+            .db
+            .get_provider_by_id("claude-official", "claude")
+            .expect("read official provider")
+            .expect("official provider exists");
+        official.sort_index = Some(3);
+        state
+            .db
+            .save_provider("claude", &official)
+            .expect("store nonzero official index");
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+        fixture.app.provider_idx = 0;
+
+        reorder(
+            &mut fixture.ctx(),
+            "claude-official".to_string(),
+            crate::cli::tui::app::MoveDirection::Down,
+        )
+        .expect("attempt to move official provider");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(3));
+        assert_eq!(providers["first"].sort_index, None);
+        assert_eq!(providers["second"].sort_index, None);
+        assert_eq!(fixture.app.provider_idx, 0);
+        assert!(matches!(
+            fixture.app.toast.as_ref(),
+            Some(toast) if toast.kind == ToastKind::Info
+        ));
+
+        fixture.app.provider_idx = 1;
+        reorder(
+            &mut fixture.ctx(),
+            "first".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("attempt to move past the top");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(3));
+        assert_eq!(providers["first"].sort_index, None);
+        assert_eq!(providers["second"].sort_index, None);
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_moves_against_visible_neighbour_with_filter() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(
+            &state,
+            &[
+                ("first", "Alpha One", "https://first.example.com"),
+                ("second", "Beta", "https://second.example.com"),
+                ("third", "Alpha Two", "https://third.example.com"),
+            ],
+        );
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+        fixture.app.filter.input.set("alpha");
+        let visible = crate::cli::tui::app::visible_providers(
+            &AppType::Claude,
+            &fixture.app.filter,
+            &fixture.data,
+        )
+        .into_iter()
+        .map(|row| row.id.clone())
+        .collect::<Vec<_>>();
+        assert_eq!(visible, vec!["first", "third"]);
+
+        reorder(
+            &mut fixture.ctx(),
+            "third".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("move third provider above the previous visible row");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["claude-official"].sort_index, Some(0));
+        assert_eq!(providers["third"].sort_index, Some(1));
+        assert_eq!(providers["second"].sort_index, Some(2));
+        assert_eq!(providers["first"].sort_index, Some(3));
+        assert_eq!(fixture.app.provider_idx, 0);
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_rejects_rows_missing_from_storage() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(&state, &[("first", "First", "https://first.example.com")]);
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+        fixture
+            .data
+            .providers
+            .rows
+            .push(crate::cli::tui::data::ProviderRow {
+                id: "ghost".to_string(),
+                provider: Provider::with_id(
+                    "ghost".to_string(),
+                    "Ghost".to_string(),
+                    json!({"env":{}}),
+                    None,
+                ),
+                api_url: None,
+                is_current: false,
+                is_in_config: true,
+                is_saved: false,
+                is_default_model: false,
+                primary_model_id: None,
+                default_model_id: None,
+            });
+
+        reorder(
+            &mut fixture.ctx(),
+            "ghost".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("attempt to move an unsaved row");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["first"].sort_index, None);
+        assert!(matches!(
+            fixture.app.toast,
+            Some(toast) if toast.kind == ToastKind::Info
+        ));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_is_blocked_while_auto_failover_routes_by_queue() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let state = load_state_with_official();
+        seed_reorder_providers(
+            &state,
+            &[
+                ("first", "First", "https://first.example.com"),
+                ("second", "Second", "https://second.example.com"),
+            ],
+        );
+
+        state
+            .db
+            .add_to_failover_queue("claude", "second")
+            .expect("queue second provider");
+        state
+            .db
+            .set_proxy_flags_sync("claude", true, true)
+            .expect("enable automatic failover");
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Claude);
+        reload_fixture_data(&mut fixture);
+        fixture.data.proxy.auto_failover_enabled = false;
+
+        reorder(
+            &mut fixture.ctx(),
+            "second".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("attempt to reorder while failover routes by queue");
+
+        let providers = state
+            .db
+            .get_all_providers("claude")
+            .expect("read providers");
+        assert_eq!(providers["first"].sort_index, None);
+        assert_eq!(providers["second"].sort_index, None);
+        assert!(matches!(
+            fixture.app.toast,
+            Some(toast) if toast.kind == ToastKind::Info
+        ));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn provider_reorder_is_blocked_for_pi() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = EnvGuard::set_home(temp_home.path());
+
+        let mut fixture = RuntimeActionFixture::new(AppType::Pi);
+        reload_fixture_data(&mut fixture);
+
+        reorder(
+            &mut fixture.ctx(),
+            "anything".to_string(),
+            crate::cli::tui::app::MoveDirection::Up,
+        )
+        .expect("attempt to reorder Pi providers");
+
+        assert!(matches!(
+            fixture.app.toast,
+            Some(toast) if toast.kind == ToastKind::Info
+        ));
     }
 
     #[test]

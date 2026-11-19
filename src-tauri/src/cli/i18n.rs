@@ -621,14 +621,14 @@ pub mod texts {
     pub fn tui_help_line_providers(app_type: &crate::app_config::AppType) -> &'static str {
         if matches!(app_type, crate::app_config::AppType::Hermes) {
             if is_chinese() {
-                "供应商：Space 添加/移除，Enter/e 编辑，a 新增，c 复制，d 删除，t 测试，r 刷新，x 启用"
+                "供应商：Space 添加/移除，Enter/e 编辑，a 新增，c 复制，d 删除，t 测试，r 刷新，x 启用，+/- 上移/下移（非 Pi，过滤时按可见行，自动故障转移开启时不可用）"
             } else {
-                "Providers: Space add/remove, Enter/e edit, a add, c copy, d delete, t test, r refresh, x enable"
+                "Providers: Space add/remove, Enter/e edit, a add, c copy, d delete, t test, r refresh, x enable, +/- move up/down (not Pi; visible rows while filtering; unavailable while automatic failover is on)"
             }
         } else if is_chinese() {
-            "供应商：Space 切换，Enter/e 编辑，a 新增，c 复制，d 删除，t 测试，r 刷新，o 临时启动(Claude/Codex)，f 管理故障转移(Claude/Codex/Gemini)，x 设为默认(OpenClaw)"
+            "供应商：Space 切换，Enter/e 编辑，a 新增，c 复制，d 删除，t 测试，r 刷新，o 临时启动(Claude/Codex)，f 管理故障转移(Claude/Codex/Gemini)，x 设为默认(OpenClaw)，+/- 上移/下移（非 Pi，过滤时按可见行，自动故障转移开启时不可用）"
         } else {
-            "Providers: Space switch, Enter/e edit, a add, c copy, d delete, t test, r refresh, o launch temp (Claude/Codex), f manage failover (Claude/Codex/Gemini), x set default (OpenClaw)"
+            "Providers: Space switch, Enter/e edit, a add, c copy, d delete, t test, r refresh, o launch temp (Claude/Codex), f manage failover (Claude/Codex/Gemini), x set default (OpenClaw), +/- move up/down (not Pi; visible rows while filtering; unavailable while automatic failover is on)"
         }
     }
 
@@ -4323,6 +4323,14 @@ pub mod texts {
             "刷新"
         } else {
             "refresh"
+        }
+    }
+
+    pub fn tui_key_reorder() -> &'static str {
+        if is_chinese() {
+            "上移/下移"
+        } else {
+            "move up/down"
         }
     }
 
@@ -13624,6 +13632,8 @@ mod tests {
         assert!(!prelude.contains("Text input:"));
         let providers = texts::tui_help_line_providers(&crate::app_config::AppType::Claude);
         assert!(providers.contains("供应商：Space 切换"));
+        assert!(providers.contains("+/- 上移/下移"));
+        assert!(providers.contains("自动故障转移开启时不可用"));
         assert!(!providers.contains("供应商详情："));
         assert!(!providers.contains("Providers:"));
         assert!(texts::tui_help_line_config().contains("配置：Enter 打开/执行"));

@@ -124,6 +124,10 @@ pub enum Action {
         id: String,
         direction: MoveDirection,
     },
+    ProviderReorder {
+        id: String,
+        direction: MoveDirection,
+    },
     ProviderQuotaRefresh {
         id: String,
     },
